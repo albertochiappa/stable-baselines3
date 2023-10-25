@@ -428,6 +428,8 @@ class ActorCriticPolicy(BasePolicy):
         ``th.optim.Adam`` by default
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
+    :param dist_kwargs: Additional keyword arguments,
+        excluding [full_std, use_expln, squash_output], to pass to the distribution
     """
 
     def __init__(
@@ -449,6 +451,8 @@ class ActorCriticPolicy(BasePolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        use_lattice: bool = False,
+        lattice_kwargs: Optional[Dict[str, Any]] = None,
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -500,9 +504,10 @@ class ActorCriticPolicy(BasePolicy):
 
         self.log_std_init = log_std_init
         dist_kwargs = None
-
+        
         assert not (squash_output and not use_sde), "squash_output=True is only available when using gSDE (use_sde=True)"
-        # Keyword arguments for gSDE distribution
+        
+        # Keyword arguments for state-dependent distributions
         if use_sde:
             dist_kwargs = {
                 "full_std": full_std,
@@ -510,12 +515,15 @@ class ActorCriticPolicy(BasePolicy):
                 "use_expln": use_expln,
                 "learn_features": False,
             }
-
+            if use_lattice:
+                lattice_kwargs = {} if lattice_kwargs is None else lattice_kwargs
+                dist_kwargs.update(lattice_kwargs)
+            
         self.use_sde = use_sde
         self.dist_kwargs = dist_kwargs
 
         # Action distribution
-        self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs)
+        self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs, use_lattice=use_lattice)
 
         self._build(lr_schedule)
 
@@ -539,6 +547,7 @@ class ActorCriticPolicy(BasePolicy):
                 optimizer_kwargs=self.optimizer_kwargs,
                 features_extractor_class=self.features_extractor_class,
                 features_extractor_kwargs=self.features_extractor_kwargs,
+                dist_kwargs=self.dist_kwargs
             )
         )
         return data
@@ -799,6 +808,8 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        use_lattice: bool = False,
+        lattice_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             observation_space,
@@ -818,6 +829,8 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
+            use_lattice,
+            lattice_kwargs
         )
 
 
@@ -872,6 +885,8 @@ class MultiInputActorCriticPolicy(ActorCriticPolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        use_lattice: bool = False,
+        lattice_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             observation_space,
@@ -891,6 +906,8 @@ class MultiInputActorCriticPolicy(ActorCriticPolicy):
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
+            use_lattice,
+            lattice_kwargs
         )
 
 

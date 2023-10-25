@@ -7,7 +7,7 @@ import numpy as np
 import torch as th
 from gymnasium import spaces
 from torch import nn
-from torch.distributions import Bernoulli, Categorical, Normal
+from torch.distributions import Bernoulli, Categorical, Normal, MultivariateNormal
 
 from stable_baselines3.common.preprocessing import get_action_dim
 
@@ -226,7 +226,7 @@ class SquashedDiagGaussianDistribution(DiagGaussianDistribution):
 
     def log_prob(self, actions: th.Tensor, gaussian_actions: Optional[th.Tensor] = None) -> th.Tensor:
         # Inverse tanh
-        # Naive implementation (not stable): 0.5 * torch.log((1 + x) / (1 - x))
+        # Naive implementation (not stable): 0.5 * th.log((1 + x) / (1 - x))
         # We use numpy to avoid numerical instability
         if gaussian_actions is None:
             # It will be clipped to avoid NaN when inversing tanh
@@ -613,6 +613,256 @@ class StateDependentNoiseDistribution(Distribution):
         return actions, log_prob
 
 
+class LatticeNoiseDistribution(DiagGaussianDistribution):
+    """
+    Like Lattice noise distribution, non-state-dependent. Does not allow time correlation, but
+    it is more efficient.
+
+    :param action_dim: Dimension of the action space.
+    """
+
+    def __init__(self, action_dim: int):
+        super().__init__(action_dim=action_dim)
+
+    def proba_distribution_net(self, latent_dim: int, log_std_init: float = 0.0) -> Tuple[nn.Module, nn.Parameter]:
+        self.mean_actions = nn.Linear(latent_dim, self.action_dim)
+        self.std_init = th.tensor(log_std_init).exp()
+        log_std = nn.Parameter(th.zeros(self.action_dim + latent_dim), requires_grad=True)
+        return self.mean_actions, log_std
+
+    def proba_distribution(self, mean_actions: th.Tensor, log_std: th.Tensor) -> "DiagGaussianDistribution":
+        """
+        Create the distribution given its parameters (mean, std)
+
+        :param mean_actions:
+        :param log_std:
+        :return:
+        """
+        std = log_std.exp() * self.std_init
+        action_variance = std[: self.action_dim] ** 2
+        latent_variance = std[self.action_dim :] ** 2
+        sigma_mat = (self.mean_actions.weight * latent_variance).matmul(self.mean_actions.weight.T)
+        sigma_mat[range(self.action_dim), range(self.action_dim)] += action_variance
+        self.distribution = MultivariateNormal(mean_actions, sigma_mat)
+        return self
+
+    def log_prob(self, actions: th.Tensor) -> th.Tensor:
+        return self.distribution.log_prob(actions)
+
+    def entropy(self) -> th.Tensor:
+        return self.distribution.entropy()
+
+
+class LatticeStateDependentNoiseDistribution(StateDependentNoiseDistribution):
+    """
+    Distribution class of Lattice exploration.
+    Paper: Latent Exploration for Reinforcement Learning https://arxiv.org/abs/2305.20065
+
+    It creates correlated noise across actuators, with a covariance matrix induced by
+    the network weights. Can improve exploration in high-dimensional systems.
+
+    :param action_dim: Dimension of the action space.
+    :param full_std: Whether to use (n_features x n_actions) parameters
+        for the std instead of only (n_features,), defaults to True
+    :param use_expln: Use ``expln()`` function instead of ``exp()`` to ensure
+        a positive standard deviation (cf paper). It allows to keep variance
+        above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
+        Defaults to False
+    :param squash_output:  Whether to squash the output using a tanh function,
+        this ensures bounds are satisfied, defaults to False
+    :param learn_features: Whether to learn features for gSDE or not, defaults to False
+        This will enable gradients to be backpropagated through the features, defaults to False
+    :param epsilon: small value to avoid NaN due to numerical imprecision, defaults to 1e-6
+    :param std_clip: clip range for the standard deviation, can be used to prevent extreme values,
+        defaults to (1e-3, 1.0)
+    :param std_reg: optional regularization to prevent collapsing to a deterministic policy,
+        defaults to 0.0
+    :param alpha: relative weight between action and latent noise, 0 removes the latent noise,
+        defaults to 1 (equal weight)
+    """
+    def __init__(
+        self,
+        action_dim: int,
+        full_std: bool = True,
+        use_expln: bool = False,
+        squash_output: bool = False,
+        learn_features: bool = False,
+        epsilon: float = 1e-6,
+        std_clip: Tuple[float, float] = (1e-3, 1.0),
+        std_reg: float = 0.0,
+        alpha: float = 1,
+    ):
+        super().__init__(
+            action_dim=action_dim,
+            full_std=full_std,
+            use_expln=use_expln,
+            squash_output=squash_output,
+            epsilon=epsilon,
+            learn_features=learn_features,
+        )
+        self.min_std, self.max_std = std_clip
+        self.std_reg = std_reg
+        self.alpha = alpha
+
+    def get_std(self, log_std: th.Tensor) -> th.Tensor:
+        """
+        Get the standard deviation from the learned parameter
+        (log of it by default). This ensures that the std is positive.
+
+        :param log_std:
+        :return:
+        """
+        # Apply correction to remove scaling of action std as a function of the latent
+        # dimension (see paper for details)
+        log_std = log_std.clip(min=np.log(self.min_std), max=np.log(self.max_std))
+        log_std = log_std - 0.5 * np.log(self.latent_sde_dim)
+
+        if self.use_expln:
+            # From gSDE paper, it allows to keep variance
+            # above zero and prevent it from growing too fast
+            below_threshold = th.exp(log_std) * (log_std <= 0)
+            # Avoid NaN: zeros values that are below zero
+            safe_log_std = log_std * (log_std > 0) + self.epsilon
+            above_threshold = (th.log1p(safe_log_std) + 1.0) * (log_std > 0)
+            std = below_threshold + above_threshold
+        else:
+            # Use normal exponential
+            std = th.exp(log_std)
+
+        if self.full_std:
+            assert std.shape == (
+                self.latent_sde_dim,
+                self.latent_sde_dim + self.action_dim,
+            )
+            corr_std = std[:, : self.latent_sde_dim]
+            ind_std = std[:, -self.action_dim :]
+        else:
+            # Reduce the number of parameters:
+            assert std.shape == (self.latent_sde_dim, 2), std.shape
+            corr_std = th.ones(self.latent_sde_dim, self.latent_sde_dim).to(log_std.device) * std[:, 0:1]
+            ind_std = th.ones(self.latent_sde_dim, self.action_dim).to(log_std.device) * std[:, 1:]
+        return corr_std, ind_std
+
+    def sample_weights(self, log_std: th.Tensor, batch_size: int = 1) -> None:
+        """
+        Sample weights for the noise exploration matrix,
+        using a centered Gaussian distribution.
+
+        :param log_std:
+        :param batch_size:
+        """
+        corr_std, ind_std = self.get_std(log_std)
+        self.corr_weights_dist = Normal(th.zeros_like(corr_std), corr_std)
+        self.ind_weights_dist = Normal(th.zeros_like(ind_std), ind_std)
+
+        # Reparametrization trick to pass gradients
+        self.corr_exploration_mat = self.corr_weights_dist.rsample()
+        self.ind_exploration_mat = self.ind_weights_dist.rsample()
+
+        # Pre-compute matrices in case of parallel exploration
+        self.corr_exploration_matrices = self.corr_weights_dist.rsample((batch_size,))
+        self.ind_exploration_matrices = self.ind_weights_dist.rsample((batch_size,))
+
+    def proba_distribution_net(
+        self,
+        latent_dim: int,
+        log_std_init: float = 0,
+        latent_sde_dim: Optional[int] = None,
+    ) -> Tuple[nn.Module, nn.Parameter]:
+        """
+        Create the layers and parameter that represent the distribution:
+        one output will be the deterministic action, the other parameter will be the
+        standard deviation of the distribution that control the weights of the noise matrix,
+        both for the action perturbation and the latent perturbation.
+
+        :param latent_dim: Dimension of the last layer of the policy (before the action layer)
+        :param log_std_init: Initial value for the log standard deviation
+        :param latent_sde_dim: Dimension of the last layer of the features extractor
+            for gSDE. By default, it is shared with the policy network.
+        :return:
+        """
+        # Note: we always consider that the noise is based on the features of the last
+        # layer, so latent_sde_dim is the same as latent_dim
+        self.mean_actions_net = nn.Linear(latent_dim, self.action_dim)
+        self.latent_sde_dim = latent_dim if latent_sde_dim is None else latent_sde_dim
+
+        log_std = (
+            th.ones(self.latent_sde_dim, self.latent_sde_dim + self.action_dim)
+            if self.full_std
+            else th.ones(self.latent_sde_dim, 2)
+        )
+
+        # Transform it into a parameter so it can be optimized
+        log_std = nn.Parameter(log_std * log_std_init, requires_grad=True)
+        # Sample an exploration matrix
+        self.sample_weights(log_std)
+        return self.mean_actions_net, log_std
+
+    def proba_distribution(
+        self,
+        mean_actions: th.Tensor,
+        log_std: th.Tensor,
+        latent_sde: th.Tensor,
+    ) -> "LatticeNoiseDistribution":
+        # Detach the last layer features because we do not want to update the noise generation
+        # to influence the features of the policy
+        self._latent_sde = latent_sde if self.learn_features else latent_sde.detach()
+        corr_std, ind_std = self.get_std(log_std)
+        latent_corr_variance = th.mm(self._latent_sde**2, corr_std**2)  # Variance of the hidden state
+        latent_ind_variance = th.mm(self._latent_sde**2, ind_std**2) + self.std_reg**2  # Variance of the action
+
+        # First consider the correlated variance
+        sigma_mat = self.alpha**2 * (self.mean_actions_net.weight * latent_corr_variance[:, None, :]).matmul(
+            self.mean_actions_net.weight.T
+        )
+        # Then the independent one, to be added to the diagonal
+        sigma_mat[:, range(self.action_dim), range(self.action_dim)] += latent_ind_variance
+        self.distribution = MultivariateNormal(loc=mean_actions, covariance_matrix=sigma_mat, validate_args=False)
+        return self
+
+    def log_prob(self, actions: th.Tensor) -> th.Tensor:
+        if self.bijector is not None:
+            gaussian_actions = self.bijector.inverse(actions)
+        else:
+            gaussian_actions = actions
+        log_prob = self.distribution.log_prob(gaussian_actions)
+
+        if self.bijector is not None:
+            # Squash correction
+            log_prob -= th.sum(self.bijector.log_prob_correction(gaussian_actions), dim=1)
+        return log_prob
+
+    def entropy(self) -> th.Tensor:
+        if self.bijector is not None:
+            return None
+        return self.distribution.entropy()
+
+    def get_noise(
+        self,
+        latent_sde: th.Tensor,
+        exploration_mat: th.Tensor,
+        exploration_matrices: th.Tensor,
+    ) -> th.Tensor:
+        latent_sde = latent_sde if self.learn_features else latent_sde.detach()
+        # Default case: only one exploration matrix
+        if len(latent_sde) == 1 or len(latent_sde) != len(exploration_matrices):
+            return th.mm(latent_sde, exploration_mat)
+        # Use batch matrix multiplication for efficient computation
+        # (batch_size, n_features) -> (batch_size, 1, n_features)
+        latent_sde = latent_sde.unsqueeze(dim=1)
+        # (batch_size, 1, n_actions)
+        noise = th.bmm(latent_sde, exploration_matrices)
+        return noise.squeeze(dim=1)
+
+    def sample(self) -> th.Tensor:
+        latent_noise = self.alpha * self.get_noise(self._latent_sde, self.corr_exploration_mat, self.corr_exploration_matrices)
+        action_noise = self.get_noise(self._latent_sde, self.ind_exploration_mat, self.ind_exploration_matrices)
+        actions = self.mean_actions_net(self._latent_sde + latent_noise) + action_noise
+        if self.bijector is not None:
+            return self.bijector.forward(actions)
+        return actions
+
+
 class TanhBijector:
     """
     Bijective transformation of a probability distribution
@@ -635,7 +885,7 @@ class TanhBijector:
         Inverse of Tanh
 
         Taken from Pyro: https://github.com/pyro-ppl/pyro
-        0.5 * torch.log((1 + x ) / (1 - x))
+        0.5 * th.log((1 + x ) / (1 - x))
         """
         return 0.5 * (x.log1p() - (-x).log1p())
 
@@ -657,7 +907,7 @@ class TanhBijector:
 
 
 def make_proba_distribution(
-    action_space: spaces.Space, use_sde: bool = False, dist_kwargs: Optional[Dict[str, Any]] = None
+    action_space: spaces.Space, use_sde: bool = False, dist_kwargs: Optional[Dict[str, Any]] = None, use_lattice: bool = False
 ) -> Distribution:
     """
     Return an instance of Distribution for the correct type of action space
@@ -672,8 +922,16 @@ def make_proba_distribution(
         dist_kwargs = {}
 
     if isinstance(action_space, spaces.Box):
-        cls = StateDependentNoiseDistribution if use_sde else DiagGaussianDistribution
-        return cls(get_action_dim(action_space), **dist_kwargs)
+        if use_lattice:
+            if use_sde:
+                return LatticeStateDependentNoiseDistribution(get_action_dim(action_space), **dist_kwargs)
+            else:
+                return LatticeNoiseDistribution(get_action_dim(action_space), **dist_kwargs)
+        else:
+            if use_sde:
+                return StateDependentNoiseDistribution(get_action_dim(action_space), **dist_kwargs)
+            else:
+                return DiagGaussianDistribution(get_action_dim(action_space), **dist_kwargs)
     elif isinstance(action_space, spaces.Discrete):
         return CategoricalDistribution(action_space.n, **dist_kwargs)
     elif isinstance(action_space, spaces.MultiDiscrete):
