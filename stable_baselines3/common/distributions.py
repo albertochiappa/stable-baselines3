@@ -21,8 +21,12 @@ SelfMultiCategoricalDistribution = TypeVar("SelfMultiCategoricalDistribution", b
 SelfBernoulliDistribution = TypeVar("SelfBernoulliDistribution", bound="BernoulliDistribution")
 SelfStateDependentNoiseDistribution = TypeVar("SelfStateDependentNoiseDistribution", bound="StateDependentNoiseDistribution")
 SelfLatticeNoiseDistribution = TypeVar("SelfLatticeNoiseDistribution", bound="LatticeNoiseDistribution")
-SelfSquashedLatticeNoiseDistribution = TypeVar("SelfSquashedLatticeNoiseDistribution", bound="SquashedLatticeNoiseDistribution")
-SelfLatticeStateDependentNoiseDistribution = TypeVar("SelfLatticeStateDependentNoiseDistribution", bound="LatticeStateDependentNoiseDistribution")
+SelfSquashedLatticeNoiseDistribution = TypeVar(
+    "SelfSquashedLatticeNoiseDistribution", bound="SquashedLatticeNoiseDistribution"
+)
+SelfLatticeStateDependentNoiseDistribution = TypeVar(
+    "SelfLatticeStateDependentNoiseDistribution", bound="LatticeStateDependentNoiseDistribution"
+)
 
 
 class Distribution(ABC):
@@ -637,7 +641,19 @@ class LatticeNoiseDistribution(DiagGaussianDistribution):
         super().__init__(action_dim=action_dim)
         self.alpha = alpha
 
-    def proba_distribution_net(self, latent_dim: int, log_std_init: float = 0.0, independent_std=True) -> Tuple[nn.Module, nn.Parameter]:
+    def proba_distribution_net(
+        self, latent_dim: int, log_std_init: float = 0.0, independent_std=True
+    ) -> Tuple[nn.Module, Union[nn.Parameter, nn.Module]]:
+        """Function to return the action network and the log std. The log std is a parameter
+        if independent_std is True. If False, it is a linear transformation of the latent
+        state (e.g., in SAC).
+
+        :param latent_dim: Size of the latent state
+        :param log_std_init: initial value of the log std, defaults to 0.0
+        :param independent_std: whether std is a parameter (and not alinear transformation
+        of the latent state), defaults to True
+        :return: actions mean and std
+        """
         self.mean_actions = nn.Linear(latent_dim, self.action_dim)
         self.std_init = th.tensor(log_std_init).exp()
         if independent_std:
@@ -678,36 +694,37 @@ class SquashedLatticeNoiseDistribution(LatticeNoiseDistribution):
     :param alpha: relative weight between action and latent noise, 0 removes the latent noise,
         defaults to 1 (equal weight)
     """
+
     def __init__(self, action_dim: int, epsilon: float = 1e-6, alpha: float = 1):
         super().__init__(action_dim=action_dim, alpha=alpha)
         self.epsilon = epsilon
         self.gaussian_actions = None
-        
+
     def proba_distribution(
         self: SelfSquashedLatticeNoiseDistribution, mean_actions: th.Tensor, log_std: th.Tensor
     ) -> SelfSquashedLatticeNoiseDistribution:
         super().proba_distribution(mean_actions, log_std)
         return self
-    
+
     def log_prob(self, actions: th.Tensor, gaussian_actions: Optional[th.Tensor] = None) -> th.Tensor:
         if gaussian_actions is None:
             gaussian_actions = TanhBijector.inverse(actions)
-            
+
         log_prob = super().log_prob(gaussian_actions)
         log_prob -= th.sum(th.log(1 - actions**2 + self.epsilon), dim=1)
         return log_prob
-    
+
     def entropy(self) -> Optional[th.Tensor]:
         return None
-    
+
     def sample(self) -> th.Tensor:
         self.gaussian_actions = super().mode()
         return th.tanh(self.gaussian_actions)
-    
+
     def mode(self) -> th.Tensor:
         self.gaussian_actions = super().mode()
         return th.tanh(self.gaussian_actions)
-    
+
     def log_prob_from_params(self, mean_actions: th.Tensor, log_std: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
         action = self.actions_from_params(mean_actions, log_std)
         log_prob = self.log_prob(action, self.gaussian_actions)
@@ -741,6 +758,7 @@ class LatticeStateDependentNoiseDistribution(StateDependentNoiseDistribution):
     :param alpha: relative weight between action and latent noise, 0 removes the latent noise,
         defaults to 1 (equal weight)
     """
+
     def __init__(
         self,
         action_dim: int,
@@ -829,6 +847,7 @@ class LatticeStateDependentNoiseDistribution(StateDependentNoiseDistribution):
         latent_dim: int,
         log_std_init: float = 0,
         latent_sde_dim: Optional[int] = None,
+        clip_mean: float = 0,
     ) -> Tuple[nn.Module, nn.Parameter]:
         """
         Create the layers and parameter that represent the distribution:
@@ -845,6 +864,12 @@ class LatticeStateDependentNoiseDistribution(StateDependentNoiseDistribution):
         # Note: we always consider that the noise is based on the features of the last
         # layer, so latent_sde_dim is the same as latent_dim
         self.mean_actions_net = nn.Linear(latent_dim, self.action_dim)
+        if clip_mean > 0:
+            self.clipped_mean_actions_net = nn.Sequential(
+                self.mean_actions_net,
+                nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean))
+        else:
+            self.clipped_mean_actions_net = self.mean_actions_net
         self.latent_sde_dim = latent_dim if latent_sde_dim is None else latent_sde_dim
 
         log_std = (
@@ -857,7 +882,7 @@ class LatticeStateDependentNoiseDistribution(StateDependentNoiseDistribution):
         log_std = nn.Parameter(log_std * log_std_init, requires_grad=True)
         # Sample an exploration matrix
         self.sample_weights(log_std)
-        return self.mean_actions_net, log_std
+        return self.clipped_mean_actions_net, log_std
 
     def proba_distribution(
         self,
@@ -865,8 +890,6 @@ class LatticeStateDependentNoiseDistribution(StateDependentNoiseDistribution):
         log_std: th.Tensor,
         latent_sde: th.Tensor,
     ) -> "LatticeNoiseDistribution":
-        # Detach the last layer features because we do not want to update the noise generation
-        # to influence the features of the policy
         self._latent_sde = latent_sde if self.learn_features else latent_sde.detach()
         corr_std, ind_std = self.get_std(log_std)
         latent_corr_variance = th.mm(self._latent_sde**2, corr_std**2)  # Variance of the hidden state
@@ -919,7 +942,7 @@ class LatticeStateDependentNoiseDistribution(StateDependentNoiseDistribution):
     def sample(self) -> th.Tensor:
         latent_noise = self.alpha * self.get_noise(self._latent_sde, self.corr_exploration_mat, self.corr_exploration_matrices)
         action_noise = self.get_noise(self._latent_sde, self.ind_exploration_mat, self.ind_exploration_matrices)
-        actions = self.mean_actions_net(self._latent_sde + latent_noise) + action_noise
+        actions = self.clipped_mean_actions_net(self._latent_sde + latent_noise) + action_noise
         if self.bijector is not None:
             return self.bijector.forward(actions)
         return actions

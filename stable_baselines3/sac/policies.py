@@ -107,17 +107,20 @@ class Actor(BasePolicy):
                     squash_output=True,
                     **self.lattice_kwargs,
                 )
+                self.mu, self.log_std = self.action_dist.proba_distribution_net(
+                    latent_dim=last_layer_dim, latent_sde_dim=last_layer_dim, log_std_init=log_std_init, clip_mean=clip_mean
+                )
             else:
                 self.action_dist = StateDependentNoiseDistribution(
                     action_dim, full_std=full_std, use_expln=use_expln, learn_features=True, squash_output=True
                 )
-            self.mu, self.log_std = self.action_dist.proba_distribution_net(
-                latent_dim=last_layer_dim, latent_sde_dim=last_layer_dim, log_std_init=log_std_init
-            )
-            # Avoid numerical issues by limiting the mean of the Gaussian
-            # to be in [-clip_mean, clip_mean]
-            if clip_mean > 0.0:
-                self.mu = nn.Sequential(self.mu, nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean))
+                self.mu, self.log_std = self.action_dist.proba_distribution_net(
+                    latent_dim=last_layer_dim, latent_sde_dim=last_layer_dim, log_std_init=log_std_init
+                )
+                # Avoid numerical issues by limiting the mean of the Gaussian
+                # to be in [-clip_mean, clip_mean]
+                if clip_mean > 0.0:
+                    self.mu = nn.Sequential(self.mu, nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean))
         else:
             if self.use_lattice:
                 self.action_dist = SquashedLatticeNoiseDistribution(action_dim, **self.lattice_kwargs)
