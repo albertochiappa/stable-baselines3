@@ -4,7 +4,12 @@ import torch as th
 from gymnasium import spaces
 from torch import nn
 
-from stable_baselines3.common.distributions import SquashedDiagGaussianDistribution, StateDependentNoiseDistribution
+from stable_baselines3.common.distributions import (
+    SquashedDiagGaussianDistribution,
+    StateDependentNoiseDistribution,
+    SquashedLatticeNoiseDistribution,
+    LatticeStateDependentNoiseDistribution,
+)
 from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
 from stable_baselines3.common.preprocessing import get_action_dim
 from stable_baselines3.common.torch_layers import (
@@ -43,6 +48,8 @@ class Actor(BasePolicy):
     :param clip_mean: Clip the mean output when using gSDE to avoid numerical instability.
     :param normalize_images: Whether to normalize images or not,
          dividing by 255.0 (True by default)
+    :param lattice_kwargs: Additional keyword arguments for Lattice exploration,
+        including [std_clip, std_reg, alpha], to pass to the distribution
     """
 
     action_space: spaces.Box
@@ -61,6 +68,8 @@ class Actor(BasePolicy):
         use_expln: bool = False,
         clip_mean: float = 2.0,
         normalize_images: bool = True,
+        use_lattice: bool = False,
+        lattice_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             observation_space,
@@ -80,6 +89,8 @@ class Actor(BasePolicy):
         self.use_expln = use_expln
         self.full_std = full_std
         self.clip_mean = clip_mean
+        self.use_lattice = use_lattice
+        self.lattice_kwargs = lattice_kwargs if lattice_kwargs is not None else {}
 
         action_dim = get_action_dim(self.action_space)
         latent_pi_net = create_mlp(features_dim, -1, net_arch, activation_fn)
@@ -87,9 +98,19 @@ class Actor(BasePolicy):
         last_layer_dim = net_arch[-1] if len(net_arch) > 0 else features_dim
 
         if self.use_sde:
-            self.action_dist = StateDependentNoiseDistribution(
-                action_dim, full_std=full_std, use_expln=use_expln, learn_features=True, squash_output=True
-            )
+            if self.use_lattice:
+                self.action_dist = LatticeStateDependentNoiseDistribution(
+                    action_dim,
+                    full_std=full_std,
+                    use_expln=use_expln,
+                    learn_features=True,
+                    squash_output=True,
+                    **self.lattice_kwargs,
+                )
+            else:
+                self.action_dist = StateDependentNoiseDistribution(
+                    action_dim, full_std=full_std, use_expln=use_expln, learn_features=True, squash_output=True
+                )
             self.mu, self.log_std = self.action_dist.proba_distribution_net(
                 latent_dim=last_layer_dim, latent_sde_dim=last_layer_dim, log_std_init=log_std_init
             )
@@ -98,9 +119,15 @@ class Actor(BasePolicy):
             if clip_mean > 0.0:
                 self.mu = nn.Sequential(self.mu, nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean))
         else:
-            self.action_dist = SquashedDiagGaussianDistribution(action_dim)  # type: ignore[assignment]
-            self.mu = nn.Linear(last_layer_dim, action_dim)
-            self.log_std = nn.Linear(last_layer_dim, action_dim)  # type: ignore[assignment]
+            if self.use_lattice:
+                self.action_dist = SquashedLatticeNoiseDistribution(action_dim, **self.lattice_kwargs)
+                self.mu, self.log_std = self.action_dist.proba_distribution_net(
+                    last_layer_dim, log_std_init, independent_std=False
+                )
+            else:
+                self.action_dist = SquashedDiagGaussianDistribution(action_dim)  # type: ignore[assignment]
+                self.mu = nn.Linear(last_layer_dim, action_dim)
+                self.log_std = nn.Linear(last_layer_dim, action_dim)  # type: ignore[assignment]
 
     def _get_constructor_parameters(self) -> Dict[str, Any]:
         data = super()._get_constructor_parameters()
@@ -116,23 +143,28 @@ class Actor(BasePolicy):
                 use_expln=self.use_expln,
                 features_extractor=self.features_extractor,
                 clip_mean=self.clip_mean,
+                use_lattice=self.use_lattice,
+                lattice_kwargs=self.lattice_kwargs,
             )
         )
         return data
 
     def get_std(self) -> th.Tensor:
         """
-        Retrieve the standard deviation of the action distribution.
-        Only useful when using gSDE.
-        It corresponds to ``th.exp(log_std)`` in the normal case,
-        but is slightly different when using ``expln`` function
-        (cf StateDependentNoiseDistribution doc).
-
-        :return:
+                Retrieve the standard deviation of the action distribution.
+                Only useful when using gSDE.
+                It corresponds to ``th.exp(log_std)`` in the normal case,
+                but is slightly different when using ``expln`` function
+                (cf StateDependentNoiseDistribution doc).
+        `
+                :return:
         """
         msg = "get_std() is only available when using gSDE"
         assert isinstance(self.action_dist, StateDependentNoiseDistribution), msg
-        return self.action_dist.get_std(self.log_std)
+        std = self.action_dist.get_std(self.log_std)
+        if self.use_lattice:
+            std = th.cat(std, dim=1)
+        return std
 
     def reset_noise(self, batch_size: int = 1) -> None:
         """
@@ -229,6 +261,8 @@ class SACPolicy(BasePolicy):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         n_critics: int = 2,
         share_features_extractor: bool = False,
+        use_lattice: bool = False,
+        lattice_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             observation_space,
@@ -264,6 +298,8 @@ class SACPolicy(BasePolicy):
             "clip_mean": clip_mean,
         }
         self.actor_kwargs.update(sde_kwargs)
+        lattice_kwargs = {} if lattice_kwargs is None else lattice_kwargs
+        self.actor_kwargs.update({"use_lattice": use_lattice, "lattice_kwargs": lattice_kwargs})
         self.critic_kwargs = self.net_args.copy()
         self.critic_kwargs.update(
             {
@@ -326,6 +362,8 @@ class SACPolicy(BasePolicy):
                 optimizer_kwargs=self.optimizer_kwargs,
                 features_extractor_class=self.features_extractor_class,
                 features_extractor_kwargs=self.features_extractor_kwargs,
+                use_lattice=self.actor_kwargs["use_lattice"],
+                lattice_kwargs=self.actor_kwargs["lattice_kwargs"]
             )
         )
         return data

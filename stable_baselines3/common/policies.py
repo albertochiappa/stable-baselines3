@@ -428,8 +428,9 @@ class ActorCriticPolicy(BasePolicy):
         ``th.optim.Adam`` by default
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
-    :param dist_kwargs: Additional keyword arguments,
-        excluding [full_std, use_expln, squash_output], to pass to the distribution
+    :param use_lattice: Whether to use Lattice exploration or not
+    :param lattice_kwargs: Additional keyword arguments for Lattice exploration,
+        including [std_clip, std_reg, alpha], to pass to the distribution
     """
 
     def __init__(
@@ -503,8 +504,8 @@ class ActorCriticPolicy(BasePolicy):
             self.vf_features_extractor = self.make_features_extractor()
 
         self.log_std_init = log_std_init
-        dist_kwargs = None
-        
+        dist_kwargs = {}
+
         assert not (squash_output and not use_sde), "squash_output=True is only available when using gSDE (use_sde=True)"
         
         # Keyword arguments for state-dependent distributions
@@ -515,9 +516,9 @@ class ActorCriticPolicy(BasePolicy):
                 "use_expln": use_expln,
                 "learn_features": False,
             }
-            if use_lattice:
-                lattice_kwargs = {} if lattice_kwargs is None else lattice_kwargs
-                dist_kwargs.update(lattice_kwargs)
+        if use_lattice:
+            lattice_kwargs = {} if lattice_kwargs is None else lattice_kwargs
+            dist_kwargs.update(lattice_kwargs)
             
         self.use_sde = use_sde
         self.dist_kwargs = dist_kwargs

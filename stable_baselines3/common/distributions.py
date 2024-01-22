@@ -20,6 +20,9 @@ SelfCategoricalDistribution = TypeVar("SelfCategoricalDistribution", bound="Cate
 SelfMultiCategoricalDistribution = TypeVar("SelfMultiCategoricalDistribution", bound="MultiCategoricalDistribution")
 SelfBernoulliDistribution = TypeVar("SelfBernoulliDistribution", bound="BernoulliDistribution")
 SelfStateDependentNoiseDistribution = TypeVar("SelfStateDependentNoiseDistribution", bound="StateDependentNoiseDistribution")
+SelfLatticeNoiseDistribution = TypeVar("SelfLatticeNoiseDistribution", bound="LatticeNoiseDistribution")
+SelfSquashedLatticeNoiseDistribution = TypeVar("SelfSquashedLatticeNoiseDistribution", bound="SquashedLatticeNoiseDistribution")
+SelfLatticeStateDependentNoiseDistribution = TypeVar("SelfLatticeStateDependentNoiseDistribution", bound="LatticeStateDependentNoiseDistribution")
 
 
 class Distribution(ABC):
@@ -615,19 +618,28 @@ class StateDependentNoiseDistribution(Distribution):
 
 class LatticeNoiseDistribution(DiagGaussianDistribution):
     """
-    Like Lattice noise distribution, non-state-dependent. Does not allow time correlation, but
-    it is more efficient.
+    Distribution class of Lattice exploration, non state-dependent.
+    Paper: Latent Exploration for Reinforcement Learning https://arxiv.org/abs/2305.20065
+
+    It creates correlated noise across actuators, with a covariance matrix induced by
+    the network weights. Can improve exploration in high-dimensional systems.
 
     :param action_dim: Dimension of the action space.
+    :param alpha: relative weight between action and latent noise, 0 removes the latent noise,
+        defaults to 1 (equal weight)
     """
 
-    def __init__(self, action_dim: int):
+    def __init__(self, action_dim: int, alpha: float = 1):
         super().__init__(action_dim=action_dim)
+        self.alpha = alpha
 
-    def proba_distribution_net(self, latent_dim: int, log_std_init: float = 0.0) -> Tuple[nn.Module, nn.Parameter]:
+    def proba_distribution_net(self, latent_dim: int, log_std_init: float = 0.0, independent_std=True) -> Tuple[nn.Module, nn.Parameter]:
         self.mean_actions = nn.Linear(latent_dim, self.action_dim)
         self.std_init = th.tensor(log_std_init).exp()
-        log_std = nn.Parameter(th.zeros(self.action_dim + latent_dim), requires_grad=True)
+        if independent_std:
+            log_std = nn.Parameter(th.zeros(self.action_dim + latent_dim), requires_grad=True)
+        else:
+            log_std = nn.Linear(latent_dim, self.action_dim + latent_dim)
         return self.mean_actions, log_std
 
     def proba_distribution(self, mean_actions: th.Tensor, log_std: th.Tensor) -> "DiagGaussianDistribution":
@@ -639,10 +651,11 @@ class LatticeNoiseDistribution(DiagGaussianDistribution):
         :return:
         """
         std = log_std.exp() * self.std_init
-        action_variance = std[: self.action_dim] ** 2
-        latent_variance = std[self.action_dim :] ** 2
-        sigma_mat = (self.mean_actions.weight * latent_variance).matmul(self.mean_actions.weight.T)
-        sigma_mat[range(self.action_dim), range(self.action_dim)] += action_variance
+        action_variance = std[..., : self.action_dim] ** 2
+        latent_variance = std[..., self.action_dim :] ** 2
+
+        sigma_mat = (self.mean_actions.weight * latent_variance[..., None, :]).matmul(self.mean_actions.weight.T)
+        sigma_mat[..., range(self.action_dim), range(self.action_dim)] += action_variance
         self.distribution = MultivariateNormal(mean_actions, sigma_mat)
         return self
 
@@ -653,9 +666,53 @@ class LatticeNoiseDistribution(DiagGaussianDistribution):
         return self.distribution.entropy()
 
 
+class SquashedLatticeNoiseDistribution(LatticeNoiseDistribution):
+    """Lattice distribution, followed by a squashing function (tanh) to ensure bounds
+
+    :param action_dim: Dimension of the action space
+    :param epsilon: small value to avoid NaN due to numerical imprecision
+    :param alpha: relative weight between action and latent noise, 0 removes the latent noise,
+        defaults to 1 (equal weight)
+    """
+    def __init__(self, action_dim: int, epsilon: float = 1e-6, alpha: float = 1):
+        super().__init__(action_dim=action_dim, alpha=alpha)
+        self.epsilon = epsilon
+        self.gaussian_actions = None
+        
+    def proba_distribution(
+        self: SelfSquashedLatticeNoiseDistribution, mean_actions: th.Tensor, log_std: th.Tensor
+    ) -> SelfSquashedLatticeNoiseDistribution:
+        super().proba_distribution(mean_actions, log_std)
+        return self
+    
+    def log_prob(self, actions: th.Tensor, gaussian_actions: Optional[th.Tensor] = None) -> th.Tensor:
+        if gaussian_actions is None:
+            gaussian_actions = TanhBijector.inverse(actions)
+            
+        log_prob = super().log_prob(gaussian_actions)
+        log_prob -= th.sum(th.log(1 - actions**2 + self.epsilon), dim=1)
+        return log_prob
+    
+    def entropy(self) -> Optional[th.Tensor]:
+        return None
+    
+    def sample(self) -> th.Tensor:
+        self.gaussian_actions = super().mode()
+        return th.tanh(self.gaussian_actions)
+    
+    def mode(self) -> th.Tensor:
+        self.gaussian_actions = super().mode()
+        return th.tanh(self.gaussian_actions)
+    
+    def log_prob_from_params(self, mean_actions: th.Tensor, log_std: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        action = self.actions_from_params(mean_actions, log_std)
+        log_prob = self.log_prob(action, self.gaussian_actions)
+        return action, log_prob
+
+
 class LatticeStateDependentNoiseDistribution(StateDependentNoiseDistribution):
     """
-    Distribution class of Lattice exploration.
+    State-dependent distribution class of Lattice exploration.
     Paper: Latent Exploration for Reinforcement Learning https://arxiv.org/abs/2305.20065
 
     It creates correlated noise across actuators, with a covariance matrix induced by
@@ -842,6 +899,7 @@ class LatticeStateDependentNoiseDistribution(StateDependentNoiseDistribution):
         latent_sde: th.Tensor,
         exploration_mat: th.Tensor,
         exploration_matrices: th.Tensor,
+        # std_reg: float = 0
     ) -> th.Tensor:
         latent_sde = latent_sde if self.learn_features else latent_sde.detach()
         # Default case: only one exploration matrix
