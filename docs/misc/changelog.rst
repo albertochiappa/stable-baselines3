@@ -3,8 +3,72 @@
 Changelog
 ==========
 
-Release 2.2.0a7 (WIP)
+Release 2.3.0a1 (WIP)
 --------------------------
+
+Breaking Changes:
+^^^^^^^^^^^^^^^^^
+- The defaults hyperparameters of ``TD3`` and ``DDPG`` have been changed to be more consistent with ``SAC``
+
+.. code-block:: python
+
+  # SB3 < 2.3.0 default hyperparameters
+  # model = TD3("MlpPolicy", env, train_freq=(1, "episode"), gradient_steps=-1, batch_size=100)
+  # SB3 >= 2.3.0:
+  model = TD3("MlpPolicy", env, train_freq=1, gradient_steps=1, batch_size=256)
+
+.. note::
+
+	Two inconsistencies remains: the default network architecture for ``TD3/DDPG`` is ``[400, 300]`` instead of ``[256, 256]`` for SAC (for backward compatibility reasons, see `report on the influence of the network size <https://wandb.ai/openrlbenchmark/sbx/reports/SBX-TD3-Influence-of-policy-net--Vmlldzo2NDg1Mzk3>`_) and the default learning rate is 1e-3 instead of 3e-4 for SAC (for performance reasons, see `W&B report on the influence of the lr <https://wandb.ai/openrlbenchmark/sbx/reports/SBX-TD3-RL-Zoo-v2-3-0a0-vs-SB3-TD3-RL-Zoo-2-2-1---Vmlldzo2MjUyNTQx>`_)
+
+
+
+- The default ``leanrning_starts`` parameter of ``DQN`` have been changed to be consistent with the other offpolicy algorithms
+
+
+.. code-block:: python
+
+  # SB3 < 2.3.0 default hyperparameters, 50_000 corresponded to Atari defaults hyperparameters
+  # model = DQN("MlpPolicy", env, learning_start=50_000)
+  # SB3 >= 2.3.0:
+  model = DQN("MlpPolicy", env, learning_start=100)
+
+
+New Features:
+^^^^^^^^^^^^^
+
+Bug Fixes:
+^^^^^^^^^^
+
+`SB3-Contrib`_
+^^^^^^^^^^^^^^
+
+`RL Zoo`_
+^^^^^^^^^
+
+`SBX`_ (SB3 + Jax)
+^^^^^^^^^^^^^^^^^^
+
+Deprecations:
+^^^^^^^^^^^^^
+
+Others:
+^^^^^^^
+
+Documentation:
+^^^^^^^^^^^^^^
+- Added a paragraph on modifying vectorized environment parameters via setters (@fracapuano)
+- Updated callback code example
+
+Release 2.2.1 (2023-11-17)
+--------------------------
+**Support for options at reset, bug fixes and better error messages**
+
+.. note::
+
+  SB3 v2.2.0 was yanked after a breaking change was found in `GH#1751 <https://github.com/DLR-RM/stable-baselines3/issues/1751>`_.
+  Please use SB3 v2.2.1 and not v2.2.0.
+
 
 Breaking Changes:
 ^^^^^^^^^^^^^^^^^
@@ -15,6 +79,9 @@ New Features:
 ^^^^^^^^^^^^^
 - Improved error message of the ``env_checker`` for env wrongly detected as GoalEnv (``compute_reward()`` is defined)
 - Improved error message when mixing Gym API with VecEnv API (see GH#1694)
+- Add support for setting ``options`` at reset with VecEnv via the ``set_options()`` method. Same as seeds logic, options are reset at the end of an episode (@ReHoss)
+- Added ``rollout_buffer_class`` and ``rollout_buffer_kwargs`` arguments to on-policy algorithms (A2C and PPO)
+
 
 Bug Fixes:
 ^^^^^^^^^^
@@ -28,16 +95,28 @@ Bug Fixes:
 - Fixed success reward dtype in ``SimpleMultiObsEnv`` (@NixGD)
 - Fixed check_env for Sequence observation space (@corentinlger)
 - Prevents instantiating BitFlippingEnv with conflicting observation spaces (@kylesayrs)
+- Fixed ResourceWarning when loading and saving models (files were not closed), please note that only path are closed automatically,
+  the behavior stay the same for tempfiles (they need to be closed manually),
+  the behavior is now consistent when loading/saving replay buffer
 
 `SB3-Contrib`_
 ^^^^^^^^^^^^^^
+- Added ``set_options`` for ``AsyncEval``
+- Added ``rollout_buffer_class`` and ``rollout_buffer_kwargs`` arguments to TRPO
 
 `RL Zoo`_
 ^^^^^^^^^
+- Removed `gym` dependency, the package is still required for some pretrained agents.
+- Added `--eval-env-kwargs` to `train.py` (@Quentin18)
+- Added `ppo_lstm` to hyperparams_opt.py (@technocrat13)
+- Upgraded to `pybullet_envs_gymnasium>=0.4.0`
+- Removed old hacks (for instance limiting offpolicy algorithms to one env at test time)
+- Updated docker image, removed support for X server
+- Replaced deprecated `optuna.suggest_uniform(...)` by `optuna.suggest_float(..., low=..., high=...)`
 
-`SBX`_
-^^^^^^^^^
-- Added ``DDPG`` and ``TD3``
+`SBX`_ (SB3 + Jax)
+^^^^^^^^^^^^^^^^^^
+- Added ``DDPG`` and ``TD3`` algorithms
 
 Deprecations:
 ^^^^^^^^^^^^^
@@ -54,10 +133,22 @@ Others:
 - Fixed ``stable_baselines3/her/her_replay_buffer.py`` type hints
 - Buffers do no call an additional ``.copy()`` when storing new transitions
 - Fixed ``ActorCriticPolicy.extract_features()`` signature by adding an optional ``features_extractor`` argument
+- Update dependencies (accept newer Shimmy/Sphinx version and remove ``sphinx_autodoc_typehints``)
+- Fixed ``stable_baselines3/common/off_policy_algorithm.py`` type hints
+- Fixed ``stable_baselines3/common/distributions.py`` type hints
+- Fixed ``stable_baselines3/common/vec_env/vec_normalize.py`` type hints
+- Fixed ``stable_baselines3/common/vec_env/__init__.py`` type hints
+- Switched to PyTorch 2.1.0 in the CI (fixes type annotations)
+- Fixed ``stable_baselines3/common/policies.py`` type hints
+- Switched to ``mypy`` only for checking types
+- Added tests to check consistency when saving/loading files
 
 Documentation:
 ^^^^^^^^^^^^^^
-
+- Updated RL Tips and Tricks (include recommendation for evaluation, added links to DroQ, ARS and SBX).
+- Fixed various typos and grammar mistakes
+- Added PokemonRedExperiments to the project page
+- Fixed an out-of-date command for installing Atari in examples
 
 Release 2.1.0 (2023-08-17)
 --------------------------
@@ -1456,7 +1547,7 @@ And all the contributors:
 @flodorner @KuKuXia @NeoExtended @PartiallyTyped @mmcenta @richardwu @kinalmehta @rolandgvc @tkelestemur @mloo3
 @tirafesi @blurLake @koulakis @joeljosephjin @shwang @rk37 @andyshih12 @RaphaelWag @xicocaio
 @diditforlulz273 @liorcohen5 @ManifoldFR @mloo3 @SwamyDev @wmmc88 @megan-klaiber @thisray
-@tfederico @hn2 @LucasAlegre @AptX395 @zampanteymedio @JadenTravnik @decodyng @ardabbour @lorenz-h @mschweizer @lorepieri8 @vwxyzjn
+@tfederico @hn2 @LucasAlegre @AptX395 @zampanteymedio @fracapuano @JadenTravnik @decodyng @ardabbour @lorenz-h @mschweizer @lorepieri8 @vwxyzjn
 @ShangqunYu @PierreExeter @JacopoPan @ltbd78 @tom-doerr @Atlis @liusida @09tangriro @amy12xx @juancroldan
 @benblack769 @bstee615 @c-rizz @skandermoalla @MihaiAnca13 @davidblom603 @ayeright @cyprienc
 @wkirgsn @AechPro @CUN-bjy @batu @IljaAvadiev @timokau @kachayev @cleversonahum
@@ -1465,6 +1556,6 @@ And all the contributors:
 @Gregwar @ycheng517 @quantitative-technologies @bcollazo @git-thor @TibiGG @cool-RR @MWeltevrede
 @carlosluis @arjun-kg @tlpss @JonathanKuelz @Gabo-Tor @iwishiwasaneagle
 @Melanol @qgallouedec @francescoluciano @jlp-ue @burakdmb @timothe-chaumont @honglu2875
-@anand-bala @hughperkins @sidney-tio @AlexPasqua @dominicgkerr @Akhilez @Rocamonde @tobirohrer @ZikangXiong
+@anand-bala @hughperkins @sidney-tio @AlexPasqua @dominicgkerr @Akhilez @Rocamonde @tobirohrer @ZikangXiong @ReHoss
 @DavyMorgan @luizapozzobon @Bonifatius94 @theSquaredError @harveybellini @DavyMorgan @FieteO @jonasreiher @npit @WeberSamuel @troiganto
 @lutogniew @lbergmann1 @lukashass @BertrandDecoster @pseudo-rnd-thoughts @stefanbschneider @kyle-he @PatrickHelm @corentinlger
