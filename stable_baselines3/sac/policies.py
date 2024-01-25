@@ -240,6 +240,9 @@ class SACPolicy(BasePolicy):
     :param n_critics: Number of critic networks to create.
     :param share_features_extractor: Whether to share or not the features extractor
         between the actor and the critic (this saves computation time)
+    :param use_lattice: Whether to use Lattice exploration or not
+    :param lattice_kwargs: Additional keyword arguments for Lattice exploration,
+        including [std_clip, std_reg, alpha], to pass to the distribution
     """
 
     actor: Actor
@@ -434,6 +437,9 @@ class CnnPolicy(SACPolicy):
     :param n_critics: Number of critic networks to create.
     :param share_features_extractor: Whether to share or not the features extractor
         between the actor and the critic (this saves computation time)
+    :param use_lattice: Whether to use Lattice exploration or not
+    :param lattice_kwargs: Additional keyword arguments for Lattice exploration,
+        including [std_clip, std_reg, alpha], to pass to the distribution
     """
 
     def __init__(
@@ -454,6 +460,8 @@ class CnnPolicy(SACPolicy):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         n_critics: int = 2,
         share_features_extractor: bool = False,
+        use_lattice: bool = False,
+        lattice_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             observation_space,
@@ -472,6 +480,8 @@ class CnnPolicy(SACPolicy):
             optimizer_kwargs,
             n_critics,
             share_features_extractor,
+            use_lattice,
+            lattice_kwargs
         )
 
 
@@ -500,6 +510,9 @@ class MultiInputPolicy(SACPolicy):
     :param n_critics: Number of critic networks to create.
     :param share_features_extractor: Whether to share or not the features extractor
         between the actor and the critic (this saves computation time)
+    :param use_lattice: Whether to use Lattice exploration or not
+    :param lattice_kwargs: Additional keyword arguments for Lattice exploration,
+        including [std_clip, std_reg, alpha], to pass to the distribution
     """
 
     def __init__(
@@ -520,6 +533,8 @@ class MultiInputPolicy(SACPolicy):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         n_critics: int = 2,
         share_features_extractor: bool = False,
+        use_lattice: bool = False,
+        lattice_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             observation_space,
@@ -538,4 +553,6 @@ class MultiInputPolicy(SACPolicy):
             optimizer_kwargs,
             n_critics,
             share_features_extractor,
+            use_lattice,
+            lattice_kwargs
         )

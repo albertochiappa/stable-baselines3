@@ -801,6 +801,9 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
         ``th.optim.Adam`` by default
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
+    :param use_lattice: Whether to use Lattice exploration or not
+    :param lattice_kwargs: Additional keyword arguments for Lattice exploration,
+        including [std_clip, std_reg, alpha], to pass to the distribution
     """
 
     def __init__(
@@ -878,6 +881,9 @@ class MultiInputActorCriticPolicy(ActorCriticPolicy):
         ``th.optim.Adam`` by default
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
+    :param use_lattice: Whether to use Lattice exploration or not
+    :param lattice_kwargs: Additional keyword arguments for Lattice exploration,
+        including [std_clip, std_reg, alpha], to pass to the distribution
     """
 
     def __init__(
